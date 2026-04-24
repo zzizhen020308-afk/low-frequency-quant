@@ -40,9 +40,10 @@ def generate_monthly_rebalance_dates(prices):
 
 
 def generate_weights(prices, rebalance_dates, momentum_top_n=50, final_select_n=20):
-    """在每个调仓日生成目标权重（适配 vectorbt 机制）"""
+    """在每个调仓日生成目标权重（波动率倒数加权版本）"""
     print(f"计算因子并生成持仓权重...")
     print(f"  调仓次数: {len(rebalance_dates)}")
+    print(f"  权重方案: 波动率倒数加权（Inverse Volatility Weighting）")
 
     momentum = calculate_momentum(prices)
     volatility = calculate_volatility(prices)
@@ -50,7 +51,7 @@ def generate_weights(prices, rebalance_dates, momentum_top_n=50, final_select_n=
     # 初始化全为 NaN，确保非调仓日引擎不产生任何交易动作
     weights = pd.DataFrame(np.nan, index=prices.index, columns=prices.columns)
 
-    # 【优化1】在第一个调仓日之前，明确将所有股票权重设为 0（空仓）
+    # 在第一个调仓日之前，明确将所有股票权重设为 0（空仓）
     first_rebalance_date = rebalance_dates[0]
     weights.loc[:first_rebalance_date - pd.Timedelta(days=1), :] = 0.0
 
@@ -62,15 +63,34 @@ def generate_weights(prices, rebalance_dates, momentum_top_n=50, final_select_n=
         if len(common_tickers) == 0:
             continue
 
+        # 第一步：选出动量最高的前 momentum_top_n 只股票
         top_momentum = date_momentum[common_tickers].nlargest(momentum_top_n).index
+
+        # 第二步：从中选出波动率最低的 final_select_n 只股票
         selected = date_volatility[top_momentum].nsmallest(final_select_n).index
 
         # 调仓日当天，先将所有股票目标权重设为 0.0（不在 selected 中的将被引擎自动平仓）
         weights.loc[rebalance_date, :] = 0.0
 
-        # 然后为选中的股票分配等权重
-        weight_per_stock = 1.0 / len(selected)
-        weights.loc[rebalance_date, selected] = weight_per_stock
+        # ========== 波动率倒数加权计算 ==========
+        # 获取入选股票在当前调仓日的波动率
+        selected_vol = date_volatility[selected]
+
+        # 防御性编程：给波动率加上一个极小的平滑项，防止除零导致 inf
+        epsilon = 1e-6
+        smoothed_vol = selected_vol + epsilon
+
+        # 计算波动率的倒数（Inverse Volatility）
+        inv_vol = 1.0 / smoothed_vol
+
+        # 归一化处理：使权重总和严格等于 1.0
+        # 即：单只股票的倒数 ÷ 所有入选股票倒数之和
+        inv_vol_sum = inv_vol.sum()
+        risk_parity_weights = inv_vol / inv_vol_sum
+        # ==============================================
+
+        # 将计算好的风险平价权重赋值
+        weights.loc[rebalance_date, selected] = risk_parity_weights
 
     # 绝对不能 ffill()，否则每天都会产生调仓手续费！
 

@@ -39,16 +39,18 @@ def generate_monthly_rebalance_dates(prices):
     return pd.DatetimeIndex(rebalance_dates)
 
 
-def generate_weights(prices, rebalance_dates, momentum_top_n=50, final_select_n=20, weight_scheme='equal'):
-    """在每个调仓日生成目标权重
+def generate_weights(prices, rebalance_dates, momentum_top_n=50, final_select_n=20, buffer_keep_n=40, weight_scheme='equal'):
+    """在每个调仓日生成目标权重（引入缓冲带机制降低换手率）
 
     参数:
+        buffer_keep_n: 缓冲带阈值，老仓位在波动率排名前N名内则优先保留
         weight_scheme: str, 权重方案:
             - 'equal': 等权重（默认，v1.0 基准，推荐使用）
             - 'inverse_volatility': 波动率倒数加权（v1.1 测试版，效果不佳）
     """
-    print(f"计算因子并生成持仓权重...")
+    print(f"计算因子并生成持仓权重（缓冲带模式）...")
     print(f"  调仓次数: {len(rebalance_dates)}")
+    print(f"  缓冲带阈值: 波动率排名前 {buffer_keep_n} 名优先保留老仓位")
 
     # 权重方案显示
     weight_scheme_names = {
@@ -67,41 +69,72 @@ def generate_weights(prices, rebalance_dates, momentum_top_n=50, final_select_n=
     first_rebalance_date = rebalance_dates[0]
     weights.loc[:first_rebalance_date - pd.Timedelta(days=1), :] = 0.0
 
+    # 记录上一期持仓，用于缓冲带逻辑
+    previous_holdings = set()
+
     for rebalance_date in rebalance_dates:
         date_momentum = momentum.loc[rebalance_date].dropna()
         date_volatility = volatility.loc[rebalance_date].dropna()
         common_tickers = date_momentum.index.intersection(date_volatility.index)
 
         if len(common_tickers) == 0:
+            previous_holdings = set()
             continue
 
-        # 第一步：选出动量最高的前 momentum_top_n 只股票
+        # ========== 第一步：选出动量最高的前 momentum_top_n 只股票 ==========
         top_momentum = date_momentum[common_tickers].nlargest(momentum_top_n).index
 
-        # 第二步：从中选出波动率最低的 final_select_n 只股票
-        selected = date_volatility[top_momentum].nsmallest(final_select_n).index
+        # ========== 第二步：按波动率从小到大排序这 50 只候选股 ==========
+        candidate_volatility = date_volatility[top_momentum].sort_values(ascending=True)
+        candidate_tickers = candidate_volatility.index.tolist()
 
+        # ========== 核心缓冲带逻辑：优先保留老仓位 ==========
+        selected = set()
+
+        # 检查上一期持仓：如果在候选池中且波动率排名在 buffer_keep_n 以内，则优先保留
+        for ticker in previous_holdings:
+            if ticker in candidate_tickers:
+                rank = candidate_tickers.index(ticker)
+                if rank < buffer_keep_n:
+                    selected.add(ticker)
+
+        # ========== 核心缓冲带逻辑：替补新仓位填补空缺 ==========
+        needed = final_select_n - len(selected)
+        if needed > 0:
+            # 按波动率排名顺序，挑选尚未入选的股票填补空缺
+            for ticker in candidate_tickers:
+                if ticker not in selected:
+                    selected.add(ticker)
+                    if len(selected) >= final_select_n:
+                        break
+
+        selected_list = list(selected)
+
+        # ========== 权重分配 ==========
         # 调仓日当天，先将所有股票目标权重设为 0.0（不在 selected 中的将被引擎自动平仓）
         weights.loc[rebalance_date, :] = 0.0
 
-        # ========== 根据权重方案计算权重 ==========
-        if weight_scheme == 'equal':
-            # 等权重
-            weight_per_stock = 1.0 / len(selected)
-            weights.loc[rebalance_date, selected] = weight_per_stock
+        if len(selected_list) > 0:
+            if weight_scheme == 'equal':
+                # 等权重
+                weight_per_stock = 1.0 / len(selected_list)
+                weights.loc[rebalance_date, selected_list] = weight_per_stock
 
-        elif weight_scheme == 'inverse_volatility':
-            # 波动率倒数加权（v1.1 测试版，效果不佳，不推荐）
-            selected_vol = date_volatility[selected]
-            epsilon = 1e-6
-            smoothed_vol = selected_vol + epsilon
-            inv_vol = 1.0 / smoothed_vol
-            inv_vol_sum = inv_vol.sum()
-            risk_parity_weights = inv_vol / inv_vol_sum
-            weights.loc[rebalance_date, selected] = risk_parity_weights
+            elif weight_scheme == 'inverse_volatility':
+                # 波动率倒数加权（不推荐）
+                selected_vol = date_volatility[selected_list]
+                epsilon = 1e-6
+                smoothed_vol = selected_vol + epsilon
+                inv_vol = 1.0 / smoothed_vol
+                inv_vol_sum = inv_vol.sum()
+                risk_parity_weights = inv_vol / inv_vol_sum
+                weights.loc[rebalance_date, selected_list] = risk_parity_weights
 
-        else:
-            raise ValueError(f"不支持的权重方案: {weight_scheme}")
+            else:
+                raise ValueError(f"不支持的权重方案: {weight_scheme}")
+
+        # 更新上一期持仓记录，供下一个调仓日使用
+        previous_holdings = selected
 
     # 绝对不能 ffill()，否则每天都会产生调仓手续费！
 

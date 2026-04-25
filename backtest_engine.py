@@ -39,11 +39,23 @@ def generate_monthly_rebalance_dates(prices):
     return pd.DatetimeIndex(rebalance_dates)
 
 
-def generate_weights(prices, rebalance_dates, momentum_top_n=50, final_select_n=20):
-    """在每个调仓日生成目标权重（波动率倒数加权版本）"""
+def generate_weights(prices, rebalance_dates, momentum_top_n=50, final_select_n=20, weight_scheme='equal'):
+    """在每个调仓日生成目标权重
+
+    参数:
+        weight_scheme: str, 权重方案:
+            - 'equal': 等权重（默认，v1.0 基准，推荐使用）
+            - 'inverse_volatility': 波动率倒数加权（v1.1 测试版，效果不佳）
+    """
     print(f"计算因子并生成持仓权重...")
     print(f"  调仓次数: {len(rebalance_dates)}")
-    print(f"  权重方案: 波动率倒数加权（Inverse Volatility Weighting）")
+
+    # 权重方案显示
+    weight_scheme_names = {
+        'equal': '等权重（Equal Weight）- 推荐',
+        'inverse_volatility': '波动率倒数加权（Inverse Volatility）- 效果不佳'
+    }
+    print(f"  权重方案: {weight_scheme_names.get(weight_scheme, weight_scheme)}")
 
     momentum = calculate_momentum(prices)
     volatility = calculate_volatility(prices)
@@ -72,25 +84,24 @@ def generate_weights(prices, rebalance_dates, momentum_top_n=50, final_select_n=
         # 调仓日当天，先将所有股票目标权重设为 0.0（不在 selected 中的将被引擎自动平仓）
         weights.loc[rebalance_date, :] = 0.0
 
-        # ========== 波动率倒数加权计算 ==========
-        # 获取入选股票在当前调仓日的波动率
-        selected_vol = date_volatility[selected]
+        # ========== 根据权重方案计算权重 ==========
+        if weight_scheme == 'equal':
+            # 等权重
+            weight_per_stock = 1.0 / len(selected)
+            weights.loc[rebalance_date, selected] = weight_per_stock
 
-        # 防御性编程：给波动率加上一个极小的平滑项，防止除零导致 inf
-        epsilon = 1e-6
-        smoothed_vol = selected_vol + epsilon
+        elif weight_scheme == 'inverse_volatility':
+            # 波动率倒数加权（v1.1 测试版，效果不佳，不推荐）
+            selected_vol = date_volatility[selected]
+            epsilon = 1e-6
+            smoothed_vol = selected_vol + epsilon
+            inv_vol = 1.0 / smoothed_vol
+            inv_vol_sum = inv_vol.sum()
+            risk_parity_weights = inv_vol / inv_vol_sum
+            weights.loc[rebalance_date, selected] = risk_parity_weights
 
-        # 计算波动率的倒数（Inverse Volatility）
-        inv_vol = 1.0 / smoothed_vol
-
-        # 归一化处理：使权重总和严格等于 1.0
-        # 即：单只股票的倒数 ÷ 所有入选股票倒数之和
-        inv_vol_sum = inv_vol.sum()
-        risk_parity_weights = inv_vol / inv_vol_sum
-        # ==============================================
-
-        # 将计算好的风险平价权重赋值
-        weights.loc[rebalance_date, selected] = risk_parity_weights
+        else:
+            raise ValueError(f"不支持的权重方案: {weight_scheme}")
 
     # 绝对不能 ffill()，否则每天都会产生调仓手续费！
 
@@ -239,7 +250,9 @@ def main(plot_charts=False):
         prices,
         rebalance_dates,
         momentum_top_n=50,
-        final_select_n=20
+        final_select_n=20,
+        weight_scheme='equal'  # ✅ 默认使用等权重（推荐）
+        # weight_scheme='inverse_volatility'  # 如需测试其他方案，取消注释这行
     )
 
     # 【优化2】使用 vectorbt 回测后再统计真实持仓
